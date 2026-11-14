@@ -1,0 +1,308 @@
+name: build
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: theos
+        run: |
+          brew install ldid xz
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: escribir proyecto
+        run: |
+          mkdir -p p/src
+          cat > p/Makefile <<'EOF'
+          TARGET := iphone:clang:latest:13.0
+          ARCHS = arm64 arm64e
+          LIBRARY_NAME = HeadAim
+          HeadAim_FILES = src/Aim.mm
+          HeadAim_CFLAGS = -fobjc-arc
+          HeadAim_FRAMEWORKS = UIKit QuartzCore
+          include $(THEOS)/makefiles/common.mk
+          include $(THEOS_MAKE_PATH)/library.mk
+          EOF
+          cat > p/src/Aim.mm <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import <Foundation/Foundation.h>
+          #import <dlfcn.h>
+          #import <math.h>
+          #import <string.h>
+          #import <unistd.h>
+          #import <pthread.h>
+          #include <initializer_list>
+
+          #define FOV_DEG      30.f
+          #define MAX_DIST     150.f
+          #define VISIBLE_ONLY 1
+          #define FIRE_ONLY    0
+          #define HEAD_LIFT    0.02f
+          #define CROUCH_DROP  0.4f
+          #define TICK_US      4000
+          #define MAX_PLAYERS  32
+
+          typedef struct { float x, y, z; } Vec3;
+          typedef struct { float x, y, z, w; } Quat;
+          typedef void Klass; typedef void FInfo; typedef void MInfo;
+
+          static void* (*p_class)(void*, const char*, const char*);
+          static FInfo* (*p_field)(Klass*, const char*);
+          static int (*p_off)(FInfo*);
+          static MInfo* (*p_method)(Klass*, const char*, int);
+          static void* (*p_dom)();
+          static void* (*p_asms)(void*, size_t*);
+          static void* (*p_img)(void*);
+          static const char* (*p_imgname)(void*);
+          static void (*p_attach)(void*);
+
+          static void* (*g_match)();
+          static void* (*g_local)(void*);
+          static void* (*g_byindex)(void*, uint8_t);
+          static bool (*g_firing)(void*);
+          static bool (*g_visible)(void*);
+          static bool (*g_islocal)(void*);
+          static bool (*g_isteam)(void*, void*);
+          static bool (*g_dieing)(void*);
+          static bool (*g_crouch)(void*);
+          static int  (*g_hp)(void*);
+          static void (*g_setaim)(void*, Quat);
+          static void* (*g_camera)();
+          static void* (*g_gettf)(void*);
+          static Vec3 (*g_getpos)(void*);
+          static Vec3 (*g_getfwd)(void*);
+
+          static int g_offHead = -1, g_offHip = -1;
+          static UILabel* gLabel;
+          static bool g_ready = false;
+          static bool g_talk = false;
+
+          static void say(NSString* s) {
+            NSLog(@"[headaim] %@", s);
+            dispatch_async(dispatch_get_main_queue(), ^{ if (gLabel) gLabel.text = s; });
+          }
+
+          static inline Vec3 vsub(Vec3 a, Vec3 b) { return (Vec3){a.x-b.x, a.y-b.y, a.z-b.z}; }
+          static inline float vlen(Vec3 a) { return sqrtf(a.x*a.x + a.y*a.y + a.z*a.z); }
+          static inline Vec3 vnorm(Vec3 a) { float l = vlen(a); return l > 1e-5f ? (Vec3){a.x/l,a.y/l,a.z/l} : (Vec3){0,0,1}; }
+          static inline float vdot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+          static inline Vec3 vcross(Vec3 a, Vec3 b) { return (Vec3){a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
+          static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+          static Quat lookAt(Vec3 from, Vec3 to) {
+            Vec3 f = vnorm(vsub(to, from));
+            Vec3 r = vnorm(vcross((Vec3){0,1,0}, f));
+            Vec3 u = vcross(f, r);
+            float tr = r.x + u.y + f.z; Quat q;
+            if (tr > 0) { float s = sqrtf(tr+1.f)*2.f; q.w=.25f*s; q.x=(u.z-f.y)/s; q.y=(f.x-r.z)/s; q.z=(r.y-u.x)/s; }
+            else if (r.x > u.y && r.x > f.z) { float s = sqrtf(1.f+r.x-u.y-f.z)*2.f; q.w=(u.z-f.y)/s; q.x=.25f*s; q.y=(u.x+r.y)/s; q.z=(f.x+r.z)/s; }
+            else if (u.y > f.z) { float s = sqrtf(1.f+u.y-r.x-f.z)*2.f; q.w=(f.x-r.z)/s; q.x=(u.x+r.y)/s; q.y=.25f*s; q.z=(u.z+f.y)/s; }
+            else { float s = sqrtf(1.f+f.z-r.x-u.y)*2.f; q.w=(r.y-u.x)/s; q.x=(f.x+r.z)/s; q.y=(u.z+f.y)/s; q.z=.25f*s; }
+            return q;
+          }
+
+          template <typename T> static void bind(T& slot, const char* n) {
+            slot = (T)dlsym(RTLD_DEFAULT, n);
+          }
+
+          static void* img(void) {
+            static void* c = nullptr;
+            if (c) return c;
+            void* d = p_dom ? p_dom() : nullptr;
+            if (!d) return nullptr;
+            size_t n = 0; void** a = (void**)p_asms(d, &n);
+            for (size_t i = 0; i < n && a; i++) {
+              void* im = p_img(a[i]); if (!im) continue;
+              const char* nm = p_imgname(im);
+              if (nm && (strstr(nm, "Assembly-CSharp") || strstr(nm, "GameAssembly"))) { c = im; break; }
+            }
+            return c;
+          }
+
+          static Klass* kls(const char* n) {
+            void* i = img(); return (i && p_class) ? p_class(i, "", n) : nullptr;
+          }
+
+          template <typename T>
+          static T mfn(const char* k, std::initializer_list<const char*> names, int argc) {
+            Klass* c = kls(k);
+            if (!c) { if (g_talk) say([NSString stringWithFormat:@"falta clase %s", k]); return nullptr; }
+            for (const char* n : names) {
+              MInfo* mi = p_method(c, n, argc);
+              if (mi) return (T)*(void**)mi;
+            }
+            if (g_talk) say([NSString stringWithFormat:@"falta metodo %s", k]);
+            return nullptr;
+          }
+
+          static int foff(const char* k, const char* const* cd, int n) {
+            Klass* c = kls(k); if (!c) return -1;
+            for (int i = 0; i < n; i++) { FInfo* f = p_field(c, cd[i]); if (f) return p_off(f); }
+            return -1;
+          }
+
+          static const char* HEAD_FIELDS[] = {"head", "Head", "headBone", "HeadBone", "m_head"};
+          static const char* HIP_FIELDS[]  = {"hip", "Hip", "pelvis", "Pelvis", "m_hip"};
+
+          static bool resolve(bool talk) {
+            g_talk = talk;
+            bind(p_class,   "il2cpp_class_from_name");
+            bind(p_field,   "il2cpp_class_get_field_from_name");
+            bind(p_off,     "il2cpp_field_get_offset");
+            bind(p_method,  "il2cpp_class_get_method_from_name");
+            bind(p_dom,     "il2cpp_domain_get");
+            bind(p_asms,    "il2cpp_domain_get_assemblies");
+            bind(p_img,     "il2cpp_assembly_get_image");
+            bind(p_imgname, "il2cpp_image_get_name");
+            bind(p_attach,  "il2cpp_thread_attach");
+
+            if (!p_class || !p_method || !p_asms || !p_img || !p_imgname) return false;
+            void* d = p_dom ? p_dom() : nullptr;
+            if (!d) return false;
+            if (p_attach) p_attach(d);
+            if (!img()) return false;
+            if (!kls("GameFacade")) return false;
+
+            g_match   = mfn<void*(*)()>("GameFacade", {"CurrentMatch"}, 0);
+            g_camera  = mfn<void*(*)()>("GameFacade", {"get_Camera", "GetCamera", "CurrentCamera"}, 0);
+            g_local   = mfn<void*(*)(void*)>("Match", {"GetLocalPlayer"}, 0);
+            g_byindex = mfn<void*(*)(void*, uint8_t)>("Match", {"getPlayerByIndex"}, 1);
+            g_isteam  = mfn<bool(*)(void*, void*)>("Match", {"IsTeammate", "isTeammate"}, 1);
+
+            g_gettf   = mfn<void*(*)(void*)>("Component", {"get_transform"}, 0);
+            g_getpos  = mfn<Vec3(*)(void*)>("Transform", {"get_position"}, 0);
+            g_getfwd  = mfn<Vec3(*)(void*)>("Transform", {"get_forward"}, 0);
+
+            g_firing  = mfn<bool(*)(void*)>("Player", {"isFiring", "get_IsFiring", "get_isFiring"}, 0);
+            g_visible = mfn<bool(*)(void*)>("Player", {"get_IsVisible", "isVisible", "get_Visible"}, 0);
+            g_islocal = mfn<bool(*)(void*)>("Player", {"get_IsLocal", "isLocal", "get_IsLocalPlayer"}, 0);
+            g_dieing  = mfn<bool(*)(void*)>("Player", {"get_IsDieing", "get_IsDead", "isDead"}, 0);
+            g_crouch  = mfn<bool(*)(void*)>("Player", {"get_IsCrouch", "get_IsCrouching", "isCrouch"}, 0);
+            g_hp      = mfn<int(*)(void*)>("Player", {"get_Health", "get_Hp", "get_HP"}, 0);
+            g_setaim  = mfn<void(*)(void*, Quat)>("Player", {"setAim", "SetAim", "set_Aim"}, 1);
+
+            if (!g_match || !g_local || !g_byindex || !g_setaim) return false;
+            if (!g_gettf || !g_getpos || !g_getfwd) return false;
+            g_talk = true;
+            return true;
+          }
+
+          static void tick(void) {
+            if (!g_ready || !g_match || !g_local || !g_byindex || !g_setaim) return;
+
+            void* m = g_match(); if (!m) return;
+            void* me = g_local(m); if (!me) return;
+            if (FIRE_ONLY && g_firing && !g_firing(me)) return;
+
+            void* cam = g_camera ? g_camera() : nullptr; if (!cam) return;
+            void* camT = g_gettf(cam); if (!camT) return;
+
+            Vec3 eye = g_getpos(camT);
+            Vec3 fwd = vnorm(g_getfwd(camT));
+
+            void* best = nullptr;
+            Vec3 bestPt = (Vec3){0,0,0};
+            float bestAng = FOV_DEG;
+
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+              void* p = g_byindex(m, (uint8_t)i);
+              if (!p || p == me) continue;
+              if (g_islocal && g_islocal(p)) continue;
+              if (g_isteam && g_isteam(m, p)) continue;
+              if (g_dieing && g_dieing(p)) continue;
+              if (g_hp && g_hp(p) <= 0) continue;
+              if (VISIBLE_ONLY && g_visible && !g_visible(p)) continue;
+
+              Vec3 hp;
+              void* bone = nullptr;
+              if (g_offHead > 0) bone = *(void**)((char*)p + g_offHead);
+              else if (g_offHip > 0) bone = *(void**)((char*)p + g_offHip);
+
+              if (bone) {
+                hp = g_getpos(bone);
+                hp.y += HEAD_LIFT;
+              } else {
+                void* pt = g_gettf(p); if (!pt) continue;
+                hp = g_getpos(pt);
+                hp.y += HEAD_LIFT;
+                if (g_crouch && g_crouch(p)) hp.y -= CROUCH_DROP;
+              }
+
+              Vec3 d = vsub(hp, eye);
+              float dist = vlen(d);
+              if (dist > MAX_DIST || dist < 0.1f) continue;
+
+              float ang = acosf(clampf(vdot(fwd, vnorm(d)), -1.f, 1.f)) * 57.2957795f;
+              if (ang > bestAng) continue;
+
+              bestAng = ang;
+              best = p;
+              bestPt = hp;
+            }
+
+            if (!best) return;
+            g_setaim(best, lookAt(eye, bestPt));
+          }
+
+          static void* worker(void*) {
+            if (p_attach && p_dom) { void* d = p_dom(); if (d) p_attach(d); }
+            while (true) {
+              @autoreleasepool { tick(); }
+              usleep(TICK_US);
+            }
+            return nullptr;
+          }
+
+          static void installLabel(void) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+              UIWindow* w = nil;
+              for (UIWindow* win in UIApplication.sharedApplication.windows) {
+                if (win.isKeyWindow) { w = win; break; }
+              }
+              if (!w) w = UIApplication.sharedApplication.windows.firstObject;
+              if (!w) return;
+              gLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 70, 300, 46)];
+              gLabel.numberOfLines = 0;
+              gLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+              gLabel.textColor = UIColor.greenColor;
+              gLabel.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.45];
+              gLabel.layer.cornerRadius = 6;
+              gLabel.clipsToBounds = YES;
+              gLabel.text = @"headaim: esperando il2cpp";
+              [w addSubview:gLabel];
+            });
+          }
+
+          __attribute__((constructor)) static void entry(void) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+              installLabel();
+              bool ok = false;
+              for (int i = 0; i < 300 && !ok; i++) {
+                @autoreleasepool { ok = resolve(i % 15 == 0); }
+                if (!ok) usleep(200000);
+              }
+              if (!ok) { say(@"il2cpp no enganchado (IPA cifrado?)"); return; }
+
+              g_offHead = foff("Player", HEAD_FIELDS, 5);
+              g_offHip  = foff("Player", HIP_FIELDS, 5);
+              say([NSString stringWithFormat:@"activo  head:%d hip:%d", g_offHead, g_offHip]);
+
+              g_ready = true;
+              pthread_t t;
+              pthread_create(&t, nullptr, worker, nullptr);
+            });
+          }
+          EOF
+
+      - name: compilar
+        run: make -C p -j$(sysctl -n hw.ncpu) FINALPACKAGE=1
+
+      - name: subir dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeadAim
+          path: p/.theos/obj/**/*.dylib
+          if-no-files-found: error
